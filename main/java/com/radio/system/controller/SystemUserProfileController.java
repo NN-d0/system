@@ -1,6 +1,6 @@
 package com.radio.system.controller;
 
-import jakarta.servlet.http.HttpServletRequest;
+import com.radio.system.context.UserContext;
 import lombok.Data;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -20,9 +20,10 @@ import java.util.UUID;
  * system 用户资料控制器
  *
  * 本次修复重点：
- * 1. 头像统一返回 public 路径，避免 PC 端 <img> 加载 /api 路径时被 401 拦截
- * 2. 兼容数据库中旧值 /api/system/file/avatar/**，查询时自动转成 /public/system/file/avatar/**
- * 3. 头像上传后直接保存 public 路径
+ * 1. 资料、密码、头像接口统一按当前登录用户处理
+ * 2. 不再通过请求头 X-Username 猜测用户
+ * 3. 不再在取不到用户时默认 admin
+ * 4. 头像仍统一返回 public 路径，避免前端 <img> 访问 /api 路径时被 401 拦截
  */
 @RestController
 @RequestMapping("/api/system/user")
@@ -34,15 +35,18 @@ public class SystemUserProfileController {
     private JdbcTemplate jdbcTemplate;
 
     @GetMapping("/profile")
-    public Map<String, Object> getCurrentUserProfile(HttpServletRequest request) {
-        String username = resolveCurrentUsername(request);
+    public Map<String, Object> getCurrentUserProfile() {
+        Long userId = UserContext.getUserId();
+        if (userId == null) {
+            return buildResponse(401, "未登录或登录已失效", null);
+        }
 
         String sql = "SELECT id, username, real_name, nick_name, avatar_url, phone, role_code, status " +
-                "FROM sys_user WHERE username = ? LIMIT 1";
+                "FROM sys_user WHERE id = ? LIMIT 1";
 
         Map<String, Object> row;
         try {
-            row = jdbcTemplate.queryForMap(sql, username);
+            row = jdbcTemplate.queryForMap(sql, userId);
         } catch (Exception e) {
             return buildResponse(500, "未找到当前用户资料", null);
         }
@@ -65,11 +69,11 @@ public class SystemUserProfileController {
     }
 
     @PutMapping("/profile/update")
-    public Map<String, Object> updateCurrentUserProfile(
-            HttpServletRequest request,
-            @RequestBody UserProfileUpdateReq req
-    ) {
-        String username = resolveCurrentUsername(request);
+    public Map<String, Object> updateCurrentUserProfile(@RequestBody UserProfileUpdateReq req) {
+        Long userId = UserContext.getUserId();
+        if (userId == null) {
+            return buildResponse(401, "未登录或登录已失效", null);
+        }
 
         String nickName = trim(req.getNickName());
         String avatarUrl = normalizeAvatarUrlToPublic(trim(firstNonBlank(req.getAvatarUrl(), req.getAvatar())));
@@ -80,29 +84,29 @@ public class SystemUserProfileController {
 
         String sql = "UPDATE sys_user " +
                 "SET nick_name = ?, avatar_url = ?, update_time = ? " +
-                "WHERE username = ?";
+                "WHERE id = ?";
 
         int updated = jdbcTemplate.update(
                 sql,
                 nickName,
                 avatarUrl,
                 LocalDateTime.now(),
-                username
+                userId
         );
 
         if (updated <= 0) {
             return buildResponse(500, "资料保存失败", null);
         }
 
-        return getCurrentUserProfile(request);
+        return getCurrentUserProfile();
     }
 
     @PutMapping("/password/update")
-    public Map<String, Object> updateCurrentUserPassword(
-            HttpServletRequest request,
-            @RequestBody PasswordUpdateReq req
-    ) {
-        String username = resolveCurrentUsername(request);
+    public Map<String, Object> updateCurrentUserPassword(@RequestBody PasswordUpdateReq req) {
+        Long userId = UserContext.getUserId();
+        if (userId == null) {
+            return buildResponse(401, "未登录或登录已失效", null);
+        }
 
         if (!StringUtils.hasText(req.getOldPassword())) {
             return buildResponse(500, "原密码不能为空", null);
@@ -116,10 +120,10 @@ public class SystemUserProfileController {
             return buildResponse(500, "新密码至少 6 位", null);
         }
 
-        String querySql = "SELECT password FROM sys_user WHERE username = ? LIMIT 1";
+        String querySql = "SELECT password FROM sys_user WHERE id = ? LIMIT 1";
         String dbPassword;
         try {
-            dbPassword = jdbcTemplate.queryForObject(querySql, String.class, username);
+            dbPassword = jdbcTemplate.queryForObject(querySql, String.class, userId);
         } catch (Exception e) {
             return buildResponse(500, "未找到当前用户", null);
         }
@@ -129,12 +133,12 @@ public class SystemUserProfileController {
             return buildResponse(500, "原密码不正确", null);
         }
 
-        String updateSql = "UPDATE sys_user SET password = ?, update_time = ? WHERE username = ?";
+        String updateSql = "UPDATE sys_user SET password = ?, update_time = ? WHERE id = ?";
         int updated = jdbcTemplate.update(
                 updateSql,
                 req.getNewPassword(),
                 LocalDateTime.now(),
-                username
+                userId
         );
 
         if (updated <= 0) {
@@ -145,10 +149,14 @@ public class SystemUserProfileController {
     }
 
     @PostMapping("/avatar/upload")
-    public Map<String, Object> uploadAvatar(
-            HttpServletRequest request,
-            @RequestParam("file") MultipartFile file
-    ) {
+    public Map<String, Object> uploadAvatar(@RequestParam("file") MultipartFile file) {
+        Long userId = UserContext.getUserId();
+        String username = UserContext.getUsername();
+
+        if (userId == null || !StringUtils.hasText(username)) {
+            return buildResponse(401, "未登录或登录已失效", null);
+        }
+
         if (file == null || file.isEmpty()) {
             return buildResponse(500, "请选择要上传的图片", null);
         }
@@ -164,9 +172,9 @@ public class SystemUserProfileController {
             return buildResponse(500, "仅支持 png/jpg/jpeg 图片", null);
         }
 
-        String username = resolveCurrentUsername(request);
         String dateDir = java.time.LocalDate.now().toString().replace("-", "");
-        String newFileName = username + "_" + UUID.randomUUID().toString().replace("-", "") + "." + ext;
+        String safeUsername = username.trim();
+        String newFileName = safeUsername + "_" + UUID.randomUUID().toString().replace("-", "") + "." + ext;
 
         String uploadRoot = Paths.get(System.getProperty("user.dir"), "uploads", "avatar").toString();
         File saveDir = Paths.get(uploadRoot, dateDir).toFile();
@@ -191,14 +199,6 @@ public class SystemUserProfileController {
         data.put("fileSize", file.getSize());
 
         return buildResponse(200, "头像上传成功", data);
-    }
-
-    private String resolveCurrentUsername(HttpServletRequest request) {
-        String headerUsername = request.getHeader("X-Username");
-        if (StringUtils.hasText(headerUsername)) {
-            return headerUsername.trim();
-        }
-        return "admin";
     }
 
     private String normalizeAvatarUrlToPublic(String avatarUrl) {
