@@ -1,5 +1,6 @@
 package com.radio.system.controller;
 
+import com.radio.system.common.ApiResponse;
 import com.radio.system.context.UserContext;
 import lombok.Data;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -19,11 +20,12 @@ import java.util.UUID;
 /**
  * system 用户资料控制器
  *
- * 本次修复重点：
- * 1. 资料、密码、头像接口统一按当前登录用户处理
- * 2. 不再通过请求头 X-Username 猜测用户
- * 3. 不再在取不到用户时默认 admin
- * 4. 头像仍统一返回 public 路径，避免前端 <img> 访问 /api 路径时被 401 拦截
+ * 当前版本统一口径：
+ * 1. 资料接口统一按当前登录用户处理
+ * 2. 不再通过 X-Username 猜测用户
+ * 3. 不再返回旧字段 avatar
+ * 4. 资料更新只允许修改 nickName、avatarUrl
+ * 5. 头像上传统一返回 avatarUrl
  */
 @RestController
 @RequestMapping("/api/system/user")
@@ -34,11 +36,14 @@ public class SystemUserProfileController {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    /**
+     * 查询当前登录用户资料
+     */
     @GetMapping("/profile")
-    public Map<String, Object> getCurrentUserProfile() {
+    public ApiResponse<Map<String, Object>> getCurrentUserProfile() {
         Long userId = UserContext.getUserId();
         if (userId == null) {
-            return buildResponse(401, "未登录或登录已失效", null);
+            return ApiResponse.fail(401, "未登录或登录已失效");
         }
 
         String sql = "SELECT id, username, real_name, nick_name, avatar_url, phone, role_code, status " +
@@ -48,7 +53,7 @@ public class SystemUserProfileController {
         try {
             row = jdbcTemplate.queryForMap(sql, userId);
         } catch (Exception e) {
-            return buildResponse(500, "未找到当前用户资料", null);
+            return ApiResponse.fail(500, "未找到当前用户资料");
         }
 
         String avatarUrl = normalizeAvatarUrlToPublic(value(row.get("avatar_url")));
@@ -59,27 +64,34 @@ public class SystemUserProfileController {
         data.put("realName", value(row.get("real_name")));
         data.put("nickName", value(row.get("nick_name")));
         data.put("avatarUrl", avatarUrl);
-        data.put("avatar", avatarUrl); // 兼容 PC 端旧字段
         data.put("phone", value(row.get("phone")));
         data.put("roleCode", value(row.get("role_code")));
         data.put("roleName", roleName(value(row.get("role_code"))));
         data.put("status", row.get("status"));
 
-        return buildResponse(200, "success", data);
+        return ApiResponse.success("success", data);
     }
 
+    /**
+     * 更新当前登录用户资料
+     * 仅允许修改：nickName、avatarUrl
+     */
     @PutMapping("/profile/update")
-    public Map<String, Object> updateCurrentUserProfile(@RequestBody UserProfileUpdateReq req) {
+    public ApiResponse<Map<String, Object>> updateCurrentUserProfile(@RequestBody UserProfileUpdateReq req) {
         Long userId = UserContext.getUserId();
         if (userId == null) {
-            return buildResponse(401, "未登录或登录已失效", null);
+            return ApiResponse.fail(401, "未登录或登录已失效");
+        }
+
+        if (req == null) {
+            return ApiResponse.fail(500, "请求参数不能为空");
         }
 
         String nickName = trim(req.getNickName());
-        String avatarUrl = normalizeAvatarUrlToPublic(trim(firstNonBlank(req.getAvatarUrl(), req.getAvatar())));
+        String avatarUrl = normalizeAvatarUrlToPublic(trim(req.getAvatarUrl()));
 
         if (!StringUtils.hasText(nickName)) {
-            return buildResponse(500, "昵称不能为空", null);
+            return ApiResponse.fail(500, "昵称不能为空");
         }
 
         String sql = "UPDATE sys_user " +
@@ -95,42 +107,52 @@ public class SystemUserProfileController {
         );
 
         if (updated <= 0) {
-            return buildResponse(500, "资料保存失败", null);
+            return ApiResponse.fail(500, "资料保存失败");
         }
 
         return getCurrentUserProfile();
     }
 
+    /**
+     * 修改当前登录用户密码
+     *
+     * 当前毕业设计最小可运行方案：
+     * 仍按明文密码比对
+     */
     @PutMapping("/password/update")
-    public Map<String, Object> updateCurrentUserPassword(@RequestBody PasswordUpdateReq req) {
+    public ApiResponse<Boolean> updateCurrentUserPassword(@RequestBody PasswordUpdateReq req) {
         Long userId = UserContext.getUserId();
         if (userId == null) {
-            return buildResponse(401, "未登录或登录已失效", null);
+            return ApiResponse.fail(401, "未登录或登录已失效");
+        }
+
+        if (req == null) {
+            return ApiResponse.fail(500, "请求参数不能为空");
         }
 
         if (!StringUtils.hasText(req.getOldPassword())) {
-            return buildResponse(500, "原密码不能为空", null);
+            return ApiResponse.fail(500, "原密码不能为空");
         }
 
         if (!StringUtils.hasText(req.getNewPassword())) {
-            return buildResponse(500, "新密码不能为空", null);
+            return ApiResponse.fail(500, "新密码不能为空");
         }
 
         if (req.getNewPassword().length() < 6) {
-            return buildResponse(500, "新密码至少 6 位", null);
+            return ApiResponse.fail(500, "新密码至少 6 位");
         }
 
         String querySql = "SELECT password FROM sys_user WHERE id = ? LIMIT 1";
+
         String dbPassword;
         try {
             dbPassword = jdbcTemplate.queryForObject(querySql, String.class, userId);
         } catch (Exception e) {
-            return buildResponse(500, "未找到当前用户", null);
+            return ApiResponse.fail(500, "未找到当前用户");
         }
 
-        // 当前毕业设计最小可运行方案：按明文比对
         if (!req.getOldPassword().equals(dbPassword)) {
-            return buildResponse(500, "原密码不正确", null);
+            return ApiResponse.fail(500, "原密码不正确");
         }
 
         String updateSql = "UPDATE sys_user SET password = ?, update_time = ? WHERE id = ?";
@@ -142,34 +164,37 @@ public class SystemUserProfileController {
         );
 
         if (updated <= 0) {
-            return buildResponse(500, "密码修改失败", null);
+            return ApiResponse.fail(500, "密码修改失败");
         }
 
-        return buildResponse(200, "密码修改成功", true);
+        return ApiResponse.success("密码修改成功", true);
     }
 
+    /**
+     * 上传头像
+     */
     @PostMapping("/avatar/upload")
-    public Map<String, Object> uploadAvatar(@RequestParam("file") MultipartFile file) {
+    public ApiResponse<Map<String, Object>> uploadAvatar(@RequestParam("file") MultipartFile file) {
         Long userId = UserContext.getUserId();
         String username = UserContext.getUsername();
 
         if (userId == null || !StringUtils.hasText(username)) {
-            return buildResponse(401, "未登录或登录已失效", null);
+            return ApiResponse.fail(401, "未登录或登录已失效");
         }
 
         if (file == null || file.isEmpty()) {
-            return buildResponse(500, "请选择要上传的图片", null);
+            return ApiResponse.fail(500, "请选择要上传的图片");
         }
 
         if (file.getSize() > MAX_AVATAR_SIZE) {
-            return buildResponse(500, "头像图片不能超过 2MB", null);
+            return ApiResponse.fail(500, "头像图片不能超过 2MB");
         }
 
         String originalFilename = file.getOriginalFilename();
         String ext = getFileExt(originalFilename);
 
         if (!isAllowedImageExt(ext)) {
-            return buildResponse(500, "仅支持 png/jpg/jpeg 图片", null);
+            return ApiResponse.fail(500, "仅支持 png/jpg/jpeg 图片");
         }
 
         String dateDir = java.time.LocalDate.now().toString().replace("-", "");
@@ -179,14 +204,14 @@ public class SystemUserProfileController {
         String uploadRoot = Paths.get(System.getProperty("user.dir"), "uploads", "avatar").toString();
         File saveDir = Paths.get(uploadRoot, dateDir).toFile();
         if (!saveDir.exists() && !saveDir.mkdirs()) {
-            return buildResponse(500, "头像目录创建失败", null);
+            return ApiResponse.fail(500, "头像目录创建失败");
         }
 
         File dest = new File(saveDir, newFileName);
         try {
             file.transferTo(dest);
         } catch (IOException e) {
-            return buildResponse(500, "头像上传失败：" + e.getMessage(), null);
+            return ApiResponse.fail(500, "头像上传失败：" + e.getMessage());
         }
 
         String relativePath = dateDir + "/" + newFileName;
@@ -194,13 +219,15 @@ public class SystemUserProfileController {
 
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("avatarUrl", avatarUrl);
-        data.put("avatar", avatarUrl); // 兼容旧字段
         data.put("fileName", newFileName);
         data.put("fileSize", file.getSize());
 
-        return buildResponse(200, "头像上传成功", data);
+        return ApiResponse.success("头像上传成功", data);
     }
 
+    /**
+     * 统一将旧头像地址转成 public 路径
+     */
     private String normalizeAvatarUrlToPublic(String avatarUrl) {
         if (!StringUtils.hasText(avatarUrl)) {
             return "";
@@ -208,7 +235,6 @@ public class SystemUserProfileController {
 
         String result = avatarUrl.trim();
 
-        // 兼容旧值：/api/system/file/avatar/**
         if (result.startsWith("/api/system/file/avatar/")) {
             result = result.replaceFirst("/api/system/file/avatar/", "/public/system/file/avatar/");
         }
@@ -237,16 +263,6 @@ public class SystemUserProfileController {
         return value == null ? "" : value.trim();
     }
 
-    private String firstNonBlank(String v1, String v2) {
-        if (StringUtils.hasText(v1)) {
-            return v1.trim();
-        }
-        if (StringUtils.hasText(v2)) {
-            return v2.trim();
-        }
-        return "";
-    }
-
     private String roleName(String roleCode) {
         if ("ADMIN".equalsIgnoreCase(roleCode)) {
             return "管理员";
@@ -254,19 +270,17 @@ public class SystemUserProfileController {
         return roleCode;
     }
 
-    private Map<String, Object> buildResponse(int code, String msg, Object data) {
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("code", code);
-        result.put("msg", msg);
-        result.put("data", data);
-        return result;
-    }
-
     @Data
     public static class UserProfileUpdateReq {
+        /**
+         * 昵称
+         */
         private String nickName;
+
+        /**
+         * 头像地址
+         */
         private String avatarUrl;
-        private String avatar;
     }
 
     @Data

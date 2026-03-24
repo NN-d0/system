@@ -70,6 +70,8 @@ public class AuthService {
         vo.setId(user.getId());
         vo.setUsername(user.getUsername());
         vo.setRealName(user.getRealName());
+        vo.setNickName(user.getNickName());
+        vo.setAvatarUrl(user.getAvatarUrl());
         vo.setRoleCode(user.getRoleCode());
         vo.setPhone(user.getPhone());
         vo.setStatus(user.getStatus());
